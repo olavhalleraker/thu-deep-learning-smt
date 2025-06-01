@@ -14,6 +14,7 @@ class SMTConfig(PretrainedConfig):
         self.out_categories = out_categories
         self.padding_token = padding_token
         self.in_channels = in_channels
+        self.dropout = 0.1
         self.w2i = w2i
         self.i2w = i2w
         self.out_dir = out_dir
@@ -22,3 +23,4 @@ class SMTConfig(PretrainedConfig):
         self.num_attn_heads = attn_heads
         self.num_dec_layers = num_dec_layers
         self.use_flash_attn = use_flash_attn
+        self.num_vit_layers: int = 6

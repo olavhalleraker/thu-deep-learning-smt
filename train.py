@@ -27,17 +27,20 @@ def main(config_path):
                                 in_channels=1, w2i=datamodule.train_set.w2i, i2w=datamodule.train_set.i2w, 
                                 d_model=256, dim_ff=256, num_dec_layers=8)
     
-    wandb_logger = WandbLogger(project='SMT_Reimplementation', group="GrandStaff", name="SMT_NexT_GrandStaff", log_model=False)
+    wandb_logger = WandbLogger(project='SMT_Reimplementation', group="GrandStaff", name="SMT_NexT_GrandStaff_vit", log_model=False)
 
     early_stopping = EarlyStopping(monitor="val_SER", min_delta=0.01, patience=5, mode="min", verbose=True)
     
-    checkpointer = ModelCheckpoint(dirpath="weights/GrandStaff/", filename="GrandStaff_SMT_NexT", 
+    checkpointer = ModelCheckpoint(dirpath="weights/GrandStaff/", filename="GrandStaff_SMT_NexT_vit", 
                                    monitor="val_SER", mode='min',
                                    save_top_k=1, verbose=True)
 
-    trainer = Trainer(max_epochs=10000, 
-                      check_val_every_n_epoch=5, 
-                      logger=wandb_logger, callbacks=[checkpointer, early_stopping], precision='16-mixed')
+    trainer = Trainer(max_epochs=10, 
+                      check_val_every_n_epoch=1, 
+                      logger=wandb_logger, callbacks=[checkpointer, early_stopping], precision='16-mixed', 
+                      accelerator='gpu',    # Enable GPU acceleration
+                      devices=1,            # Use 1 GPU (use -1 for all available GPUs)
+                      enable_progress_bar=True)
     
     trainer.fit(model_wrapper,datamodule=datamodule)
 

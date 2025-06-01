@@ -9,8 +9,10 @@ from typing import Optional, Tuple
 
 from .configuration_smt import SMTConfig
 
-from transformers import ConvNextConfig, ConvNextModel, PreTrainedModel
+from transformers import ConvNextConfig, ConvNextModel, ViTConfig, PreTrainedModel
+from transformers.models.vit.modeling_vit import ViTEncoder 
 from transformers.modeling_outputs import CausalLMOutputWithCrossAttentions
+
 
 class PositionalEncoding2D(nn.Module):
 
@@ -338,46 +340,153 @@ class SMTOutput(CausalLMOutputWithCrossAttentions):
 class SMTModelForCausalLM(PreTrainedModel):
     config_class = SMTConfig
 
-    def __init__(self, config:SMTConfig):
+    def __init__(self, config: SMTConfig):
         super().__init__(config)
-        conv_next_stages = 3
-        next_config = ConvNextConfig(num_channels=config.in_channels,
-                                     num_stages=conv_next_stages, hidden_sizes=[64,128,256], depths=[3,3,9])
-        self.encoder = ConvNextModel(next_config)
+
+        # 1. ConvNeXt as initial feature extractor (CNN backbone)
+        conv_next_stages = 3 # Number of stages in ConvNeXt, can be configured
+        convnext_config = ConvNextConfig(
+            num_channels=config.in_channels,
+            num_stages=conv_next_stages,
+            hidden_sizes=[96, 192, 384], # Example output channels for each stage
+            depths=[3, 3, 9] # Example depths for each stage
+        )
+        self.convnext_backbone = ConvNextModel(convnext_config)
+
+        # Determine the output channels of ConvNeXt's last stage
+        convnext_output_channels = convnext_config.hidden_sizes[-1] # e.g., 384
+
+        # Calculate image downsampling factor by ConvNeXt
+        # ConvNeXt's patch_embed has stride 4, and each subsequent stage (from stage 1 onwards)
+        # has a downsample layer with stride 2.
+        # Total reduction = 4 * (2^(num_stages - 1)) for num_stages > 0
+        # If num_stages = 3, reduction = 4 * (2^(3-1)) = 4 * 4 = 16
+        self.width_reduction = 4 * (2 ** (conv_next_stages - 1)) if conv_next_stages > 0 else 1
+        self.height_reduction = 4 * (2 ** (conv_next_stages - 1)) if conv_next_stages > 0 else 1
+
+        # 2. Linear projection layer to match ConvNeXt output channels to ViT's hidden_size (d_model)
+        self.vit_projection = nn.Linear(convnext_output_channels, config.d_model)
+
+        # 3. 2D Positional Encoding for the projected ConvNeXt features
+        # Applied before flattening for the ViT encoder
+        self.pos2D = PositionalEncoding2D(dim=config.d_model,
+                                          h_max=config.maxh // self.height_reduction,
+                                          w_max=config.maxw // self.width_reduction)
+
+        # 4. Vision Transformer Encoder
+        # The ViTEncoder itself is just the stack of transformer layers, it expects pre-processed embeddings.
+        vit_config = ViTConfig(
+            image_size=1, # Dummy, not used as we feed a token sequence
+            patch_size=1, # Dummy
+            num_channels=config.d_model, # Dummy, refers to the feature dimension after projection
+            hidden_size=config.d_model, # The actual embedding dimension for ViT tokens
+            num_hidden_layers=config.num_vit_layers, # From SMTConfig
+            num_attention_heads=config.num_attn_heads,
+            intermediate_size=config.dim_ff, # Feed-forward dimension for ViT blocks
+            hidden_act="gelu",
+            dropout=config.dropout,
+            attention_probs_dropout_prob=config.dropout,
+            # We don't need a class token for this feature extraction setup
+            # We don't need the pooling layer as it's not for classification here
+            add_pooling_layer=False
+        )
+        self.vit_encoder = ViTEncoder(vit_config) # ViTEncoder handles self-attention and FFN
+
+        # 5. Decoder (remains unchanged)
         self.decoder = Decoder(num_dec_layers=config.num_dec_layers,
                                d_model=config.d_model, dim_ff=config.dim_ff, n_heads=config.num_attn_heads,
                                max_seq_length=config.maxlen, out_categories=config.out_categories)
 
-        self.width_reduction = 2**(conv_next_stages+1)
-        self.height_reduction = 2**(conv_next_stages+1)
-
-        self.pos2D = PositionalEncoding2D(dim=config.d_model, h_max=config.maxh // self.height_reduction, w_max=config.maxw // self.width_reduction)
-
         self.padding_token = config.padding_token
-
         self.loss = nn.CrossEntropyLoss(ignore_index=config.padding_token)
-
         self.w2i = config.w2i
         self.i2w = config.i2w
         self.maxlen = int(config.maxlen)
 
-    def forward_encoder(self, x):
-        return self.encoder(pixel_values=x).last_hidden_state
+    def forward_encoder(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Processes the input image through ConvNeXt and then the Vision Transformer encoder.
 
-    def forward_decoder(self, encoder_output, last_predictions, get_weights=False):
-        b, _, _, _ = encoder_output.size()
+        Args:
+            x (torch.Tensor): Input image tensor (B, C_in, H_img, W_img).
 
-        encoder_output_2D = self.pos2D(encoder_output)
-        encoder_features = torch.flatten(encoder_output, start_dim=2, end_dim=3).permute(0, 2, 1)
-        encoder_features_2D = torch.flatten(encoder_output_2D, start_dim=2, end_dim=3).permute(0, 2, 1)
-        key_target_mask = self._generate_token_mask([lp.shape[0] for lp in last_predictions], last_predictions.size(), device=last_predictions.device)
+        Returns:
+            torch.Tensor: Encoded features from the Vision Transformer (B, N_patches, D_model).
+        """
+        # 1. ConvNeXt backbone to extract initial features
+        # Output shape: (B, convnext_output_channels, H_reduced, W_reduced)
+        convnext_features = self.convnext_backbone(pixel_values=x).last_hidden_state
+
+        # 2. Project ConvNeXt channels to d_model for ViT compatibility
+        # Linear layer expects the last dimension as features, so permute first:
+        # (B, C, H, W) -> (B, H, W, C) -> (B, H, W, D_model)
+        convnext_features_proj = self.vit_projection(convnext_features.permute(0, 2, 3, 1))
+        # Permute back to (B, D_model, H, W) for PositionalEncoding2D
+        convnext_features_proj = convnext_features_proj.permute(0, 3, 1, 2)
+
+        # 3. Add 2D positional encoding to the projected features
+        # Output shape: (B, D_model, H_reduced, W_reduced)
+        features_with_pe = self.pos2D(convnext_features_proj)
+
+        # 4. Flatten the 2D features into a sequence of tokens for the ViT encoder
+        # Output shape: (B, N_patches, D_model) where N_patches = H_reduced * W_reduced
+        vit_input_sequence = features_with_pe.flatten(start_dim=2).permute(0, 2, 1)
+
+        # 5. Pass through the Vision Transformer encoder layers
+        # The ViTEncoder returns a BaseModelOutput, access `last_hidden_state`.
+        # Output shape: (B, N_patches, D_model)
+        vit_encoded_features = self.vit_encoder(hidden_states=vit_input_sequence).last_hidden_state
+
+        return vit_encoded_features
+
+    def forward_decoder(
+        self,
+        encoder_output: torch.Tensor, # This is `vit_encoded_features` now
+        last_predictions: torch.Tensor,
+        get_weights: bool = False
+    ) -> SMTOutput:
+        """
+        Forward pass for the decoder.
+
+        Args:
+            encoder_output (torch.Tensor): Encoded features from the Vision Transformer (B, N_patches, D_model).
+            last_predictions (torch.Tensor): Previous token predictions for decoder input.
+            get_weights (bool): Whether to return attention weights.
+
+        Returns:
+            SMTOutput: Decoder output.
+        """
+        # `encoder_output` is already the `vit_encoded_features` from `forward_encoder`.
+        # It's a 3D tensor (B, N_patches, D_model) and contains positional information
+        # implicitly learned by the ViT's self-attention and explicitly added by `pos2D`.
+        # Therefore, we can use it for both key and value in the cross-attention.
+        encoder_output_2D = encoder_output  # Used as key for cross-attention
+        encoder_features = encoder_output   # Used as value for cross-attention
+
+        # Generate masks for decoder self-attention and cross-attention
+        batch_size, _ = last_predictions.size()
+        key_target_mask = self._generate_token_mask(
+            [lp.shape[0] for lp in last_predictions], # This line needs `lp` to be actual lengths for batching
+            last_predictions.size(),
+            device=last_predictions.device
+        )
         causal_mask = self._generate_causal_mask(last_predictions.size(1), last_predictions.device)
 
-        output, predictions, weights = self.decoder(decoder_input=last_predictions,
-                                                    encoder_output_2D=encoder_features_2D, encoder_output_raw=encoder_features,
-                                                    tgt_mask=causal_mask, tgt_key_padding_mask=key_target_mask,
-                                                    memory_key_padding_mask=None, #[TODO] This only works with one sample per batch
-                                                    return_weights=get_weights)
+        # Note: The original code commented "[TODO] This only works with one sample per batch" for
+        # `memory_key_padding_mask`. If your `encoder_output` (N_patches) length can vary within a batch
+        # (e.g., variable input image sizes), you would need to generate and pass a mask here.
+        # Assuming fixed input image sizes (maxh, maxw) means N_patches is constant.
+        memory_key_padding_mask = None # For fixed input image size, no padding mask is needed for encoder output
+
+        output, predictions, weights = self.decoder(
+            decoder_input=last_predictions,
+            encoder_output_2D=encoder_output_2D,
+            encoder_output_raw=encoder_features,
+            tgt_mask=causal_mask,
+            tgt_key_padding_mask=key_target_mask,
+            memory_key_padding_mask=memory_key_padding_mask,
+            return_weights=get_weights
+        )
 
         return SMTOutput(
             logits=predictions,
@@ -386,45 +495,97 @@ class SMTModelForCausalLM(PreTrainedModel):
             cross_attentions=None if weights is None else weights["cross_attn"]
         )
 
-    def forward(self, encoder_input, decoder_input, labels=None):
+    def forward(self, encoder_input: torch.Tensor, decoder_input: torch.Tensor, labels: Optional[torch.Tensor] = None) -> SMTOutput:
+        """
+        Main forward pass of the SMT model.
+
+        Args:
+            encoder_input (torch.Tensor): Input image tensor.
+            decoder_input (torch.Tensor): Decoder input sequence (e.g., token IDs including <bos>).
+            labels (Optional[torch.Tensor]): Target labels for loss computation (shifted decoder input).
+
+        Returns:
+            SMTOutput: Model output including logits and optionally loss.
+        """
         x = self.forward_encoder(encoder_input)
         output = self.forward_decoder(x, decoder_input)
 
         if labels is not None:
-            output.loss = self.loss(output.logits.permute(0,2,1).contiguous(), labels[:, :-1])
+            # Shift the labels for causal language modeling loss calculation
+            output.loss = self.loss(output.logits.permute(0, 2, 1).contiguous(), labels[:, :-1])
 
         return output
 
-    @torch.no_grad
-    def predict(self, input, convert_to_str=False, return_weights=False):
-        predicted_sequence = torch.from_numpy(np.asarray([self.w2i['<bos>']])).to(input.device).unsqueeze(0)
+    @torch.no_grad() # Use @torch.no_grad() decorator for prediction
+    def predict(self, input: torch.Tensor, convert_to_str: bool = False, return_weights: bool = False) -> Tuple[list, SMTOutput]:
+        """
+        Generates a sequence of tokens from an input image.
+
+        Args:
+            input (torch.Tensor): Input image tensor (e.g., preprocessed sheet music).
+            convert_to_str (bool): If True, convert predicted token IDs to their string representations.
+            return_weights (bool): If True, return attention weights from the decoder.
+
+        Returns:
+            Tuple[list, SMTOutput]: A tuple containing the generated text sequence (list of tokens)
+                                    and the model's output object.
+        """
+        predicted_sequence = torch.tensor([[self.w2i['<bos>']]], dtype=torch.long, device=input.device)
         encoder_output = self.forward_encoder(input)
         text_sequence = []
-        for i in range(self.maxlen - predicted_sequence.shape[-1]):
-            output = self.forward_decoder(encoder_output=encoder_output, last_predictions=predicted_sequence,
+
+        for i in range(self.maxlen - 1): # Maxlen - 1 to account for <bos>
+            output = self.forward_decoder(encoder_output=encoder_output,
+                                          last_predictions=predicted_sequence,
                                           get_weights=return_weights)
-            predicted_token = torch.argmax(output.logits[:, -1, :], dim=-1).item()
-            predicted_sequence = torch.cat([predicted_sequence, torch.argmax(output.logits[:, -1, :], dim=-1, keepdim=True)], dim=1)
-            if convert_to_str:
-                predicted_token = f"{predicted_token}"
-            if self.i2w[predicted_token] == '<eos>':
+
+            # Get the predicted token ID for the last position
+            predicted_token_id = torch.argmax(output.logits[:, -1, :], dim=-1).item()
+
+            # Append the new token to the sequence
+            predicted_sequence = torch.cat([predicted_sequence, torch.tensor([[predicted_token_id]], dtype=torch.long, device=input.device)], dim=1)
+
+            # Break if <eos> token is predicted
+            if self.i2w[predicted_token_id] == '<eos>':
                 break
-            text_sequence.append(self.i2w[predicted_token])
+
+            # Add token to result list
+            token_representation = self.i2w[predicted_token_id] if convert_to_str else predicted_token_id
+            text_sequence.append(token_representation)
 
         return text_sequence, output
 
+    def _generate_token_mask(self, token_len: list, total_size: Tuple[int, int], device: torch.device) -> torch.Tensor:
+        """
+        Generates a padding mask for a batch of sequences.
 
-    def _generate_token_mask(self, token_len, total_size, device):
+        Args:
+            token_len (list): List of actual lengths of sequences in the batch.
+            total_size (Tuple[int, int]): (batch_size, max_seq_length).
+            device (torch.device): Device to place the mask on.
+
+        Returns:
+            torch.Tensor: Boolean mask where False indicates padded tokens.
+        """
         batch_size, len_mask = total_size
         mask = torch.zeros((batch_size, len_mask), dtype=torch.bool, device=device)
-        for i, len_ in enumerate(token_len):
-            mask[i, :len_] = True
-
+        for i, length in enumerate(token_len):
+            mask[i, :length] = True
         return mask
 
-    def _generate_causal_mask(self, token_len, device):
+    def _generate_causal_mask(self, token_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Generates a causal (look-ahead) mask for self-attention.
+
+        Args:
+            token_len (int): Length of the sequence.
+            device (torch.device): Device to place the mask on.
+
+        Returns:
+            torch.Tensor: Boolean mask where True allows attention and False masks it.
+        """
         causal_mask = torch.triu(
-                torch.ones(token_len, token_len, dtype=torch.bool, device=device),
-                diagonal=1
-            )
+            torch.ones(token_len, token_len, dtype=torch.bool, device=device),
+            diagonal=1 # Mask out future positions
+        )
         return causal_mask
