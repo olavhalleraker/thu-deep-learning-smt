@@ -36,7 +36,7 @@ def main(config_path):
                                    save_top_k=1, verbose=True)
 
     trainer = Trainer(max_epochs=10, 
-                      check_val_every_n_epoch=1, 
+                      check_val_every_n_epoch=5, 
                       logger=wandb_logger, callbacks=[checkpointer, early_stopping], precision='16-mixed', 
                       accelerator='gpu',    # Enable GPU acceleration
                       devices=1,            # Use 1 GPU (use -1 for all available GPUs)
